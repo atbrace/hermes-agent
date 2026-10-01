@@ -1731,9 +1731,14 @@ class ProcessRegistry(ProcessCheckpointMixin):
             was_running = session.id in self._running
             if was_running:
                 session.exited_at = time.time()
-                # Keep the session tracked until its result is durable. A finite
-                # parent must not observe completion and exit during this write.
-                save_completed_result(session)
+            notification = self._build_completion_notification(session) if (
+                was_running and session.notify_on_complete) else None
+            # Keep the session tracked until its result is durable. A finite
+            # parent must not observe completion and exit during this write.
+            # The notification rides the same durable receipt: an owner that dies
+            # before draining gets the completion replayed, never silently lost.
+            save_completed_result(session, notification=notification)
+            if was_running:
                 self._running.pop(session.id)
             self._finished[session.id] = session
         # Release the retained Popen/PTY handles now: otherwise every
@@ -1747,26 +1752,33 @@ class ProcessRegistry(ProcessCheckpointMixin):
         # buffered ``output_buffer``, never from the pipe.
         self._release_finished_handles(session)
         self._write_checkpoint()
-        if was_running and session.notify_on_complete:
-            notification = {
-                "type": "completion",
-                "session_id": session.id,
-                "session_key": session.session_key,
-                "task_id": session.task_id,
-                "owner_task_id": session.owner_task_id,
-                "command": session.command,
-                **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
-                **self._exit_fields(session),
-                # A consumer that relays the output (a bot DM's reply) must know it is not whole.
-                **_completion_output(session),
-                # Stable producer identity across checkpoint recovery (unlike a
-                # consumer-observed completion timestamp).
-                "started_at": session.started_at,
-            }
-            _redact_process_result(notification)
+        if notification is not None:
             self.completion_queue.put(notification)
         session._completion_event.set()
         return was_running
+
+    def _build_completion_notification(self, session: ProcessSession) -> dict:
+        """The ``type=completion`` event for a notify_on_complete exit. Built BEFORE the
+        consumed sets are consulted so the same payload rides the durable receipt: an
+        owning process that dies without draining gets it replayed by
+        ``restore_completions()`` (delivered-or-retried, never best-effort)."""
+        notification = {
+            "type": "completion",
+            "session_id": session.id,
+            "session_key": session.session_key,
+            "task_id": session.task_id,
+            "owner_task_id": session.owner_task_id,
+            "command": session.command,
+            **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
+            **self._exit_fields(session),
+            # A consumer that relays the output (a bot DM's reply) must know it is not whole.
+            **_completion_output(session),
+            # Stable producer identity across checkpoint recovery (unlike a
+            # consumer-observed completion timestamp).
+            "started_at": session.started_at,
+        }
+        _redact_process_result(notification)
+        return notification
 
     @staticmethod
     def _exit_fields(session: ProcessSession) -> dict:
@@ -1943,10 +1955,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
             return evt_session_key == session_key
         # Restored payloads from a previous process: an unfiltered drain cannot prove
         # ownership, so leave them for the owner.
-        return not (is_async_delegation and evt.get("restored"))
+        if evt.get("restored") and (is_async_delegation or evt.get("type") == "completion"):
+            return False
+        return True
 
     def restore_completions(self) -> int:
-        """Rehydrate durable delegation completions from the LAUNCH profile's ledger, once per
+        """Rehydrate durable delegation completions AND undelivered process completion
+        notifications from the LAUNCH profile's ledger, once per
         process. Called by the first consumer that drains the queue (CLI/TUI drain, gateway boot,
         TUI poller) so a mere ``import model_tools`` never touches state.db (#123265). The replay
         always runs in the launch scope: the TUI poller / prompt_turn drain call this under the
@@ -1960,7 +1975,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
         token = set_hermes_home_override(None)
         try:
             from tools.async_delegation import restore_undelivered_completions
-            return restore_undelivered_completions(self.completion_queue)
+            from tools.process_registry_results import restore_pending_process_completions
+            count = restore_undelivered_completions(self.completion_queue)
+            try:
+                count += restore_pending_process_completions(self.completion_queue)
+            except Exception as exc:
+                logger.warning("Could not restore pending process completions: %s", exc)
+            return count
         except Exception as exc:
             logger.warning("Could not restore async delegation completions: %s", exc)
             return 0
@@ -1981,6 +2002,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
         self.restore_completions()
         results: "list[tuple[dict, str]]" = []
         requeue: "list[dict]" = []
+        # Restored receipts whose completion this drain resolves (delivered, already
+        # in hand, or suppressed): their retry marker clears at the drain boundary.
+        resolved_receipts: "set[str]" = set()
         # delegation.surface_child_process_notifications, read at most once per drain
         # and only when an sa- event shows up.
         surface_child: "bool | None" = None
@@ -1998,6 +2022,9 @@ class ProcessRegistry(ProcessCheckpointMixin):
             _evt_sid = evt.get("session_id", "")
             if evt.get("type") == "completion" and self._drain_should_skip(
                 _evt_sid, skip_poll_observed=skip_poll_observed):
+                # The result is already in hand (wait/log/poll): the notification
+                # contract is resolved, not retried — in-process or restored.
+                resolved_receipts.add(_evt_sid)
                 continue
             # Subagent-owned process notifications are suppressed by default — the
             # child's delegation result is the deliverable. Judge ownership on
@@ -2015,11 +2042,24 @@ class ProcessRegistry(ProcessCheckpointMixin):
                         "(delegation.surface_child_process_notifications=false): "
                         "type=%s session_id=%s task_id=%s",
                         evt.get("type", "completion"), _evt_sid, _evt_task_id)
+                    if evt.get("type") == "completion":
+                        resolved_receipts.add(_evt_sid)
                     continue
             if text := format_process_notification(evt):
+                if evt.get("type") == "completion":
+                    # Owned and handed to a consumer: delivered. Resolve the durable
+                    # retry marker so no later process replays a phantom turn.
+                    resolved_receipts.add(_evt_sid)
                 results.append((evt, text))
         for evt in requeue:
             self.completion_queue.put(evt)
+        if resolved_receipts:
+            from tools.process_registry_results import clear_pending_notification
+            for _sid in resolved_receipts:
+                try:
+                    clear_pending_notification(_sid)
+                except Exception:
+                    logger.debug("Could not resolve pending completion %s", _sid, exc_info=True)
         return results
 
     # Minimum suffix chars for prefix resolution; "p"/"proc_1" are too collision-prone.

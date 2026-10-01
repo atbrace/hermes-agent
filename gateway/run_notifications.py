@@ -95,6 +95,17 @@ INTERNAL_NOTIFICATION_FOOTER = (
 )
 
 
+def _clear_pending_completion_receipt(session_id: str) -> None:
+    """Resolve a receipt's durable retry marker after a gateway watcher delivery (or a
+    consumption skip). Best-effort: the marker's replay guards make a failure at-most-
+    once-safe, so never raise into a watcher."""
+    from tools.process_registry_results import clear_pending_notification
+    try:
+        clear_pending_notification(session_id)
+    except Exception:
+        logger.debug("Could not resolve pending completion receipt %s", session_id, exc_info=True)
+
+
 def _mark_internal_notification(text: str) -> str:
     """Append unambiguous machine provenance to model-facing notification text (#52694).
 
@@ -2069,6 +2080,7 @@ class GatewayNotificationsMixin:
             if silent:
                 # Still wait for the process to exit so we can log it, but don't push any messages.
                 if session.exited:
+                    _clear_pending_completion_receipt(session_id)
                     break
                 continue
             current_output_len = len(session.output_buffer)
@@ -2090,6 +2102,10 @@ class GatewayNotificationsMixin:
                         # The process remains terminal; retry after failed adapter injection instead
                         # of suppressing the result.
                         continue
+                    # Delivered (or deduped as already-delivered this lifecycle): resolve
+                    # the durable retry marker so a later drain in another process does
+                    # not replay this completion as a phantom turn.
+                    _clear_pending_completion_receipt(session_id)
                     # The agent normally reports the result itself, so the chat gets no separate receipt.
                     # While the launching turn is still running the injection only queues a follow-up, and
                     # the chat would stay mute for as long as that turn lasts (#112033): send the concise
@@ -2107,6 +2123,7 @@ class GatewayNotificationsMixin:
                         "Process watcher: completion for %s already consumed "
                         "via wait/log — skipping raw notification (#65379)", session_id,
                     )
+                    _clear_pending_completion_receipt(session_id)
                     break
                 if notify_mode in {"concise", "all", "result"} or (
                     notify_mode == "error" and session.exit_code not in {0, None}
