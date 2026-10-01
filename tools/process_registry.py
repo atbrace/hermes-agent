@@ -1731,6 +1731,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
             was_running = session.id in self._running
             if was_running:
                 session.exited_at = time.time()
+            # Built under the lock (the receipt must carry it), with the session's OWN
+            # task_id pre-resolved: the empty-task_id fallback in _redact_process_result
+            # re-enters this non-reentrant lock via process_registry.get() and would
+            # self-deadlock here. The session is in hand — the lookup is redundant.
             notification = self._build_completion_notification(session) if (
                 was_running and session.notify_on_complete) else None
             # Keep the session tracked until its result is durable. A finite
@@ -1758,10 +1762,13 @@ class ProcessRegistry(ProcessCheckpointMixin):
         return was_running
 
     def _build_completion_notification(self, session: ProcessSession) -> dict:
-        """The ``type=completion`` event for a notify_on_complete exit. Built BEFORE the
-        consumed sets are consulted so the same payload rides the durable receipt: an
-        owning process that dies without draining gets it replayed by
-        ``restore_completions()`` (delivered-or-retried, never best-effort)."""
+        """The ``type=completion`` event for a notify_on_complete exit. Built while the
+        caller holds the registry lock (so the same payload rides the durable receipt) and
+        BEFORE the consumed sets are consulted: an owning process that dies without
+        draining gets it replayed by ``restore_completions()`` (delivered-or-retried,
+        never best-effort). The session's own ``task_id`` is passed pre-resolved to
+        redaction — the fallback lookup would re-enter the non-reentrant lock.
+        """
         notification = {
             "type": "completion",
             "session_id": session.id,
@@ -1777,7 +1784,10 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # consumer-observed completion timestamp).
             "started_at": session.started_at,
         }
-        _redact_process_result(notification)
+        # The session is in hand: resolving the owner task id from it is exactly what
+        # the _redact_process_result fallback does via process_registry.get() — which
+        # takes the lock this caller already holds. Pre-resolve to stay deadlock-free.
+        _redact_process_result(notification, resolved_task_id=str(session.task_id or ""))
         return notification
 
     @staticmethod
@@ -2047,8 +2057,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
                     continue
             if text := format_process_notification(evt):
                 if evt.get("type") == "completion":
-                    # Owned and handed to a consumer: delivered. Resolve the durable
-                    # retry marker so no later process replays a phantom turn.
+                    # Owned, rendered, and handed to this consumer: the delivery contract
+                    # is resolved AT THE DRAIN BOUNDARY (delivered-or-retried, never
+                    # delivered-and-re-retried). Consumers run their claim/complete
+                    # handshake immediately after this drain (cli, one-shot, gateway);
+                    # resolving here is what keeps a delivered completion from replaying
+                    # as a phantom turn on every later process start within the window.
                     resolved_receipts.add(_evt_sid)
                 results.append((evt, text))
         for evt in requeue:
@@ -2779,13 +2793,17 @@ def transform_process_output(output: str, *, command: str, returncode: Optional[
     return _apply_output_transform_hook(command, output, returncode, task_id or "", "")
 
 
-def _redact_process_result(result: dict) -> dict:
+def _redact_process_result(result: dict, *, resolved_task_id: "str | None" = None) -> dict:
     """Transform, then redact secrets from background-process output before it reaches the
     model, session.db and CLI, mirroring the foreground ``terminal`` pipeline (hook first,
     redaction after) so the two surfaces can't diverge. Respects ``security.redact_secrets``;
     ``redact_terminal_output`` picks ``code_file`` from the recorded command.
 
     The command string itself is also redacted in case it carried an inline credential. See #43025.
+
+    ``resolved_task_id`` passes the owner's task id when the caller already holds the session:
+    the registry-lookup fallback below takes ``process_registry``'s non-reentrant lock, so
+    calling it from inside a registry-locked section with an empty ``task_id`` self-deadlocks.
     """
     if not isinstance(result, dict):
         return result
@@ -2793,8 +2811,8 @@ def _redact_process_result(result: dict) -> dict:
 
     command = result.get("command") or ""
     # The hook's task_id is the process OWNER's (poll/log/wait results carry only session_id).
-    task_id = str(result.get("task_id") or "")
-    if not task_id and (session := process_registry.get(str(result.get("session_id") or ""))) is not None:
+    task_id = resolved_task_id if resolved_task_id is not None else str(result.get("task_id") or "")
+    if not task_id and resolved_task_id is None and (session := process_registry.get(str(result.get("session_id") or ""))) is not None:
         task_id = str(getattr(session, "task_id", "") or "")
     for key in ("output", "output_preview"):
         if isinstance(value := result.get(key), str) and value:
