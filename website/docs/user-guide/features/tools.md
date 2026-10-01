@@ -248,9 +248,13 @@ completion**, under `logs/process-results/` in the profile's Hermes home. Each
 receipt contains at most the existing rolling **200,000-character output tail**,
 with terminal secret-redaction rules always applied, even when live-output
 redaction is disabled. Receipts expire on subsequent
-result reads or writes. Recovery does not rerun commands or replay completion
-notifications. This preserves work that finished while the parent was alive;
-it does not keep unfinished children alive after a timeout or crash.
+result reads or writes. Recovery does not rerun commands. A `notify_on_complete`
+completion that died with its process before delivery is retried, not lost: the
+receipt carries it until the owning session's next touch delivers it exactly once
+(delivered-or-retried), up to a 48-hour replay window after which the retry is
+resolved and the result stays queryable on demand. This preserves work that
+finished while the parent was alive; it does not keep unfinished children alive
+after a timeout or crash.
 
 ## Sudo Support
 
