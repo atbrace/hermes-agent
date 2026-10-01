@@ -64,7 +64,7 @@ def _receipt_path(hermes_home, session_id):
 
 
 def _load_receipt(hermes_home, session_id):
-    return json.loads(_receipt_path(hermes_home, session_id).read_text(encoding="utf-8"))
+    return json.loads(_receipt_path(hermes_home, session_id).read_text(encoding="utf-8-sig"))
 
 
 def _exit_in_dying_process(session):
