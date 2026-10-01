@@ -1737,12 +1737,12 @@ class ProcessRegistry(ProcessCheckpointMixin):
             # self-deadlock here. The session is in hand — the lookup is redundant.
             notification = self._build_completion_notification(session) if (
                 was_running and session.notify_on_complete) else None
-            # Keep the session tracked until its result is durable. A finite
-            # parent must not observe completion and exit during this write.
-            # The notification rides the same durable receipt: an owner that dies
-            # before draining gets the completion replayed, never silently lost.
-            save_completed_result(session, notification=notification)
             if was_running:
+                # Keep the session tracked until its result is durable. A finite
+                # parent must not observe completion and exit during this write.
+                # The notification rides the same durable receipt: an owner that dies
+                # before draining gets the completion replayed, never silently lost.
+                save_completed_result(session, notification=notification)
                 self._running.pop(session.id)
             self._finished[session.id] = session
         # Release the retained Popen/PTY handles now: otherwise every
