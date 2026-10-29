@@ -2038,7 +2038,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessOu
             # taken before the reader's final drain is partial: still read-only.
             if not finalizing:
                 self._poll_observed.add(session_id)
-                self._notice_retired.add(session_id)
+                self.retire_completion_notice(session_id)
         if session.detached and not session.output_log:
             result.update(detached=True, note="Process recovered after restart -- output history unavailable")
         return result
