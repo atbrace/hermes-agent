@@ -35,6 +35,7 @@ from agent.conversation_compression import (
     _pruned_skill_reload_notice,
     _strip_stale_todo_snapshot,
 )
+from agent.conversation_compression import _is_real_user_message as _conversation_is_real_user
 from hermes_state import SessionDB
 from tools.todo_tool import TODO_INJECTION_HEADER
 
@@ -316,3 +317,67 @@ class TestNoticeStripLifecycle:
         assert "fresh task" in tail_text
         assert "skill_view(name='hodle-design-system')" in tail_text
         assert "keep this human text" in tail_text
+
+
+class TestReloadNoticeWithoutTodo:
+    """sys-e18z77: the reload notice was gated behind a non-empty todo list, so
+    todo-free sessions crossed the boundary with pruned skill bodies and no
+    pointer back. The notice must be emitted whenever it is non-empty, and the
+    todo-free variant must not claim a task list that isn't there."""
+
+    def test_reload_notice_emitted_without_todo_snapshot(self, tmp_path):
+        summary = (
+            "[CONTEXT COMPACTION] summary\n\n## Pruned Skills\n"
+            + _skill_pruned_marker("hodle-design-system")
+        )
+        db = SessionDB(db_path=tmp_path / "state.db")
+        parent = "PARENT_SKILL_TODO_FREE"
+        db.create_session(parent, source="cli")
+        agent = _build_agent_with_db(db, parent)
+        agent.context_compressor.compress.return_value = [
+            {"role": "user", "content": summary},
+            {"role": "assistant", "content": "acknowledged"},
+        ]
+        # Empty store: format_for_injection() returns None, no snapshot is folded.
+        compressed, _ = agent._compress_context(
+            _msgs(), "sys", approx_tokens=120_000
+        )
+        db.close()
+        notice_rows = [
+            m for m in compressed
+            if _PRUNED_SKILL_RELOAD_NOTICE_HEADER in str(m.get("content") or "")
+        ]
+        assert len(notice_rows) == 1
+        row = notice_rows[-1]
+        assert compressed[-1] is row
+        assert row.get("_pruned_skill_notice_synthetic") is True
+        assert "skill_view(name='hodle-design-system')" in str(row["content"])
+        # Todo-free framing: no false claim about a preserved task list, and
+        # the row is scaffolding, never human evidence (#69292).
+        assert "task list" not in str(row["content"])
+        assert TODO_INJECTION_HEADER not in str(row["content"])
+        assert not _conversation_is_real_user(row)
+
+    def test_standalone_notice_does_not_stack_across_boundaries(self, tmp_path):
+        """Second boundary refreshes the notice row in place / re-emits one copy
+        instead of stacking duplicates (#26981 parity)."""
+        from agent.conversation_compression import _fold_todo_snapshot
+
+        marker = _skill_pruned_marker("alpha")
+        agent = _build_agent_with_db(
+            SessionDB(db_path=tmp_path / "state.db"), "PARENT_NOTICE_RESTRIPE"
+        )
+        compressed = [
+            {"role": "user", "content": f"[CONTEXT COMPACTION] {marker}"},
+            {"role": "assistant", "content": "ack"},
+            {"role": "user", "content": f"{_PRUNED_SKILL_RELOAD_NOTICE_HEADER}\nold skill_view(name='stale-skill').",
+             "_pruned_skill_notice_synthetic": True},
+        ]
+        _fold_todo_snapshot(agent, compressed)
+        notices = [
+            m for m in compressed
+            if isinstance(m, dict) and _PRUNED_SKILL_RELOAD_NOTICE_HEADER in str(m.get("content") or "")
+        ]
+        assert len(notices) == 1
+        assert "stale-skill" not in str(notices[0]["content"])
+        assert "skill_view(name='alpha')" in str(notices[0]["content"])
