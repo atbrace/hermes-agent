@@ -2293,11 +2293,22 @@ _PRUNED_SKILL_RELOAD_NOTICE_HEADER = "[Skills pruned during compression — relo
 
 def _strip_stale_reload_notice(agent: Any, compressed: list) -> None:
     """Drop the standalone pruned-skill reload notice block from a previous boundary (in place).
-    Flag-targeted and unconditional — unlike the todo strip it must not depend on store authority;
-    without it the notice accumulates across boundaries (#26981 parity, sys-e18z77)."""
+    Content-targeted and unconditional (todo-strip parity): SessionDB does not persist the synthetic
+    flag, so flag-only detection no-ops on resumed sessions and notices accumulate (#26981 parity,
+    sys-e18z77). Real user rows are never candidates (#69292)."""
     for i in range(len(compressed) - 1, -1, -1):
         msg = compressed[i]
-        if not isinstance(msg, dict) or not msg.get("_pruned_skill_notice_synthetic"):
+        if (
+            not isinstance(msg, dict)
+            or msg.get("role") != "user"
+            or not (
+                msg.get("_pruned_skill_notice_synthetic")
+                or (
+                    _PRUNED_SKILL_RELOAD_NOTICE_HEADER in _message_text(msg)
+                    and not _is_real_user_message(msg)
+                )
+            )
+        ):
             continue
         content = msg.get("content")
 
@@ -3131,14 +3142,11 @@ def _fold_todo_snapshot(agent: Any, compressed: list) -> None:
         # guidance reaches the model on todo-free sessions.
         _reload_notice = _pruned_skill_reload_notice(compressed, with_todo=False)
         if _reload_notice:
-            from agent.context_compressor import _append_text_to_content
-            _tail = compressed[-1] if compressed and isinstance(compressed[-1], dict) else None
-            if _tail is not None and _tail.get("role") == "user" and not _is_real_user_message(_tail):
-                # Consecutive user rows break strict-alternation templates; fold into the scaffolding tail.
-                _replace_message_content(_tail, _append_text_to_content(_tail.get("content"), _reload_notice))
-                _tail["_pruned_skill_notice_synthetic"] = True
-            else:
-                compressed.append({"role": "user", "content": _reload_notice, "_pruned_skill_notice_synthetic": True})
+            # Always a flagged standalone row: welding it into a user tail (real or scaffolding)
+            # would lose the synthetic marker through _merge_consecutive_users and make the notice
+            # permanent human-provenance text (#69292); the replay user-merge pass already
+            # handles adjacency without upgrading provenance.
+            compressed.append({"role": "user", "content": _reload_notice, "_pruned_skill_notice_synthetic": True})
 
 
 def _rebuild_system_prompt_at_boundary(agent: Any, system_message: str) -> str:
