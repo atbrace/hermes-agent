@@ -381,3 +381,57 @@ class TestReloadNoticeWithoutTodo:
         assert len(notices) == 1
         assert "stale-skill" not in str(notices[0]["content"])
         assert "skill_view(name='alpha')" in str(notices[0]["content"])
+
+    def test_notice_never_welded_into_real_user_tail(self, tmp_path):
+        """A human tail must not absorb the notice: _merge_consecutive_users keeps
+        the prev row's keys and drops the synthetic marker, which would make the
+        notice permanent human-provenance text (#69292). The notice stays its own
+        flagged row even when the fold lands on a session with a human tail."""
+        summary = (
+            "[CONTEXT COMPACTION] summary\n\n## Pruned Skills\n"
+            + _skill_pruned_marker("alpha")
+        )
+        agent = _build_agent_with_db(
+            SessionDB(db_path=tmp_path / "state.db"), "PARENT_NOTICE_REAL_TAIL"
+        )
+        from agent.conversation_compression import _fold_todo_snapshot
+
+        compressed = [
+            {"role": "user", "content": summary},
+            {"role": "assistant", "content": "ack"},
+            tail := {"role": "user", "content": "human keep-me"},
+        ]
+        _fold_todo_snapshot(agent, compressed)
+        assert "keep-me" in str(tail["content"])
+        assert _PRUNED_SKILL_RELOAD_NOTICE_HEADER not in str(tail["content"])
+        notice = compressed[-1]
+        assert notice is not tail
+        assert notice.get("_pruned_skill_notice_synthetic") is True
+        assert _PRUNED_SKILL_RELOAD_NOTICE_HEADER in str(notice["content"])
+        assert _conversation_is_real_user(tail)
+        assert not _conversation_is_real_user(notice)
+
+    def test_strip_survives_db_reload_flag_loss(self, tmp_path):
+        """SessionDB does not persist _pruned_skill_notice_synthetic; a reloaded
+        stale notice row carries only its header text and must still be stripped
+        so notices never stack across resumed sessions."""
+        from agent.conversation_compression import _fold_todo_snapshot
+
+        marker = _skill_pruned_marker("alpha")
+        agent = _build_agent_with_db(
+            SessionDB(db_path=tmp_path / "state.db"), "PARENT_NOTICE_RELOAD_STRIP"
+        )
+        compressed = [
+            {"role": "user", "content": f"[CONTEXT COMPACTION] {marker}"},
+            {"role": "assistant", "content": "ack"},
+            # DB-reload simulation: header text survived, the flag did not.
+            {"role": "user", "content": f"{_PRUNED_SKILL_RELOAD_NOTICE_HEADER}\nold skill_view(name='stale-skill')."},
+        ]
+        _fold_todo_snapshot(agent, compressed)
+        notices = [
+            m for m in compressed
+            if isinstance(m, dict) and _PRUNED_SKILL_RELOAD_NOTICE_HEADER in str(m.get("content") or "")
+        ]
+        assert len(notices) == 1
+        assert "stale-skill" not in str(notices[0]["content"])
+        assert "skill_view(name='alpha')" in str(notices[0]["content"])
