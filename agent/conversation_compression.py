@@ -2293,22 +2293,21 @@ _PRUNED_SKILL_RELOAD_NOTICE_HEADER = "[Skills pruned during compression — relo
 
 def _strip_stale_reload_notice(agent: Any, compressed: list) -> None:
     """Drop the standalone pruned-skill reload notice block from a previous boundary (in place).
-    Content-targeted and unconditional (todo-strip parity): SessionDB does not persist the synthetic
-    flag, so flag-only detection no-ops on resumed sessions and notices accumulate (#26981 parity,
-    sys-e18z77). Real user rows are never candidates (#69292)."""
+    Content-targeted and unconditional (todo-strip parity): the replay user-merge pass welds a
+    flagged notice into a real-user tail and keeps prev's keys, so neither the synthetic flag nor
+    real-user exclusion can gate detection — strip by content; the cut preserves the human prefix
+    (#26981 parity, sys-e18z77). Rows carrying TODO_INJECTION_HEADER are owned by the todo strip:
+    cutting the coupled notice there would regress the #84718 coupling when the store is not
+    authoritative."""
+    from tools.todo_tool import TODO_INJECTION_HEADER
     for i in range(len(compressed) - 1, -1, -1):
         msg = compressed[i]
-        if (
-            not isinstance(msg, dict)
-            or msg.get("role") != "user"
-            or not (
-                msg.get("_pruned_skill_notice_synthetic")
-                or (
-                    _PRUNED_SKILL_RELOAD_NOTICE_HEADER in _message_text(msg)
-                    and not _is_real_user_message(msg)
-                )
-            )
-        ):
+        if not isinstance(msg, dict) or msg.get("role") != "user":
+            continue
+        _text = _message_text(msg)
+        if TODO_INJECTION_HEADER in _text:
+            continue
+        if not (msg.get("_pruned_skill_notice_synthetic") or _PRUNED_SKILL_RELOAD_NOTICE_HEADER in _text):
             continue
         content = msg.get("content")
 

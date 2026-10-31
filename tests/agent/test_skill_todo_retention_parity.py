@@ -32,10 +32,10 @@ from agent.context_compressor import (
 )
 from agent.conversation_compression import (
     _PRUNED_SKILL_RELOAD_NOTICE_HEADER,
+    _is_real_user_message as _conversation_is_real_user,
     _pruned_skill_reload_notice,
     _strip_stale_todo_snapshot,
 )
-from agent.conversation_compression import _is_real_user_message as _conversation_is_real_user
 from hermes_state import SessionDB
 from tools.todo_tool import TODO_INJECTION_HEADER
 
@@ -410,6 +410,36 @@ class TestReloadNoticeWithoutTodo:
         assert _PRUNED_SKILL_RELOAD_NOTICE_HEADER in str(notice["content"])
         assert _conversation_is_real_user(tail)
         assert not _conversation_is_real_user(notice)
+
+    def test_notice_welded_by_repair_is_stripped_at_next_boundary(self, tmp_path):
+        """fold -> replay repair -> fold: the user-merge pass welds the flagged
+        notice into the real-user tail (prev's keys kept, flag lost), so the next
+        boundary must strip it by content and re-emit exactly one notice instead
+        of stacking (sys-e18z77 review)."""
+        from agent.conversation_compression import _fold_todo_snapshot
+
+        marker = _skill_pruned_marker("alpha")
+        agent = _build_agent_with_db(
+            SessionDB(db_path=tmp_path / "state.db"), "PARENT_NOTICE_WELD_RESTRIPE"
+        )
+        compressed = [
+            {"role": "user", "content": f"[CONTEXT COMPACTION] {marker}"},
+            {"role": "assistant", "content": "ack"},
+            tail := {"role": "user", "content": "human keep-me"},
+        ]
+        _fold_todo_snapshot(agent, compressed)
+        agent._repair_message_sequence(compressed)
+        # Weld confirmed: notice rode into the human row and lost its flag.
+        assert _PRUNED_SKILL_RELOAD_NOTICE_HEADER in str(tail["content"])
+        _fold_todo_snapshot(agent, compressed)
+        notices = [
+            m for m in compressed
+            if isinstance(m, dict) and _PRUNED_SKILL_RELOAD_NOTICE_HEADER in str(m.get("content") or "")
+        ]
+        assert len(notices) == 1
+        assert _PRUNED_SKILL_RELOAD_NOTICE_HEADER not in str(tail["content"])
+        assert str(tail["content"]) == "human keep-me"
+        assert notices[0] is not tail
 
     def test_strip_survives_db_reload_flag_loss(self, tmp_path):
         """SessionDB does not persist _pruned_skill_notice_synthetic; a reloaded
