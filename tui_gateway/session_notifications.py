@@ -220,7 +220,8 @@ def _notif_slash_loop_tick(rid: str, sid: str, session: dict, mgr, wakeup: str) 
         err = (resp or {}).get("error")
         payload = (resp or {}).get("result") or {}
         out = str(payload.get("output") or "").strip()
-        send = payload.get("type") == "send" and payload.get("message")
+        # Skill commands dispatch back type 'skill' with a message (methods_tools.py); treat it like 'send'.
+        send = payload.get("type") in ("send", "skill") and payload.get("message")
         if out:
             _notif_loop_status(sid, out)
         if err or not (out or send):

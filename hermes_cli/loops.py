@@ -487,6 +487,7 @@ class LoopManager:
         if not s or s.status == "cleared":
             return None
         s.status, s.paused_reason, s.awaiting_response = "active", None, False
+        s.slash_noop_streak = 0  # fresh chance: one more invisible tick must not re-pause instantly
         # Re-arm relative to now so a long pause doesn't fire instantly N times.
         delay = s.current_delay or s.interval_seconds or self_paced_floor_seconds()
         s.next_due_at = time.time() + min(delay, 5.0)

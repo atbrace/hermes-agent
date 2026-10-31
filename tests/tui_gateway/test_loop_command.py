@@ -250,3 +250,27 @@ def test_slash_loop_noop_ticks_pause_the_loop(server, session):
     assert any("unknown command" in t for t in statuses)  # the dispatch error is surfaced, not swallowed
     assert any("/loop resume" in t for t in statuses)
     assert "no output" in (state.paused_reason or "")
+
+
+def test_slash_loop_skill_command_runs_the_turn_and_clears_the_streak(server, session):
+    """A skill command dispatches back type 'skill' with a message (methods_tools.py): the tick
+    must run it as a turn, not class the bead's own repro (/loop 5m /<skill>) as a no-op."""
+    sid, session_key, s = session
+    from hermes_cli.loops import LoopManager, save_loop
+
+    mgr = LoopManager(session_key)
+    mgr.set("/my-skill", interval_seconds=60)
+    mgr.state.slash_noop_streak = 2
+    mgr.state.next_due_at = time.time() - 1
+    save_loop(session_key, mgr.state)
+
+    with patch.object(server, "_emit"), \
+         patch.object(server, "_run_prompt_submit", return_value=True) as submit, \
+         patch.dict(server._methods, {"command.dispatch": lambda rid, params: {
+             "result": {"type": "skill", "message": "run the skill"}}}):
+        server._maybe_fire_tui_loop_tick(sid, s)
+
+    submit.assert_called_once()
+    assert submit.call_args[0][3] == "run the skill"
+    state = LoopManager(session_key).state
+    assert state.slash_noop_streak == 0 and state.status == "active"
