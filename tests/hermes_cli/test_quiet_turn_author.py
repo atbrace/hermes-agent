@@ -321,6 +321,20 @@ def test_post_answer_clean_completion_gate_off_without_json_answer(monkeypatch, 
     assert result == {"final_response": "[Background process finished: OK]"}
 
 
+def test_post_answer_clean_completion_mid_answer_json_still_wakes(monkeypatch):
+    """A ```json example quoted mid-prose is not a receipt: only an answer-ENDING block suppresses the wake."""
+    from hermes_cli import quiet_single_query as qsq
+    _quiet_drain(monkeypatch, [({"type": "completion", "session_key": "s", "exit_code": 0},
+                                "[Background process finished: OK]")])
+    seen = []
+    result = qsq.continue_quiet_notify_completions(
+        "s", lambda text: seen.append(text) or {"final_response": text},
+        linger_budget=0.0,
+        final_answer='example payload:\n```json\n{"a": 1}\n```\nthen some closing prose')
+    assert seen == ["[Background process finished: OK]"]
+    assert result == {"final_response": "[Background process finished: OK]"}
+
+
 def test_post_answer_clean_completion_keeps_printed_answer(monkeypatch, capsys):
     """End to end: the late completion is dropped before stdout flushes, so the receipt stays the answer."""
     from tools.process_registry import process_registry

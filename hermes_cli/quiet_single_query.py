@@ -183,7 +183,7 @@ def _diagnostic_only_wake_muted(events) -> bool:
 
 # A one-shot answer ending in a fenced ```json receipt block (carrier node_outcome token) is the
 # final word: a late notify_on_complete exit-0 is the run's own machinery winding down, not news.
-_FINAL_JSON_BLOCK_RE = re.compile(r"```json\b.*?```", re.DOTALL)
+_FINAL_JSON_BLOCK_RE = re.compile(r"```json\b.*?```\s*\Z", re.DOTALL)
 
 
 def answer_has_final_json(text: str | None) -> bool:
@@ -194,7 +194,7 @@ def answer_has_final_json(text: str | None) -> bool:
 def _clean_completion_event(event) -> bool:
     """A plain completion whose process exited 0 (not a failure notice): nothing to wake for."""
     return (isinstance(event, dict) and event.get("type") == "completion"
-            and not event.get("task_failure_notice") and int(event.get("exit_code") or 0) == 0)
+            and int(event.get("exit_code") or 0) == 0)
 
 
 def quiet_notify_linger_seconds() -> float:
