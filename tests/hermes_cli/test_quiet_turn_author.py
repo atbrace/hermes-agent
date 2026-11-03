@@ -304,8 +304,8 @@ def test_post_answer_clean_completion_async_delegation_still_wakes(monkeypatch):
     result = qsq.continue_quiet_notify_completions(
         "s", lambda text: seen.append(text) or {"final_response": text},
         linger_budget=0.0, final_answer=ANSWER_WITH_RECEIPT)
-    assert seen == ["[IMPORTANT: delegated reply from C]\n\n[watch: pattern matched]"]
-    assert result == {"final_response": seen[0]}
+    assert seen == ["[IMPORTANT: delegated reply from C]", "[watch: pattern matched]"]
+    assert result == {"final_response": "[watch: pattern matched]"}
 
 
 def test_post_answer_clean_completion_gate_off_without_json_answer(monkeypatch, tmp_path):
